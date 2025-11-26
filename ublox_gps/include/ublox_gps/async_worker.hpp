@@ -31,6 +31,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -146,6 +147,9 @@ class AsyncWorker final : public Worker {
   int debug_; //!< Used to determine which debug messages to display
 
   rclcpp::Logger logger_;
+
+  std::size_t consecutive_read_errors_{0}; //!< Counter for consecutive read errors
+  static constexpr std::size_t kMaxConsecutiveReadErrors{10}; //!< Max errors before terminating
 };
 
 template <typename StreamT>
@@ -280,10 +284,20 @@ void AsyncWorker<StreamT>::readEnd(const asio::error_code& error,
                                    std::size_t bytes_transferred) {
   std::lock_guard<std::mutex> lock(read_mutex_);
   if (error) {
-    RCLCPP_ERROR(logger_, "U-Blox ASIO input buffer read error: %s, %li",
+    ++consecutive_read_errors_;
+    RCLCPP_ERROR(logger_, "U-Blox ASIO input buffer read error: %s, %li (error %zu/%zu)",
                  error.message().c_str(),
-                 bytes_transferred);
+                 bytes_transferred,
+                 consecutive_read_errors_,
+                 kMaxConsecutiveReadErrors);
+    if (consecutive_read_errors_ >= kMaxConsecutiveReadErrors) {
+      RCLCPP_FATAL(logger_, "Too many consecutive read errors (%zu), serial communication appears broken. Terminating.",
+                   consecutive_read_errors_);
+      rclcpp::shutdown();
+      std::exit(1);
+    }
   } else if (bytes_transferred > 0) {
+    consecutive_read_errors_ = 0;  // Reset error counter on successful read
     in_buffer_size_ += bytes_transferred;
 
     unsigned char *pRawDataStart = &(*(in_.begin() + (in_buffer_size_ - bytes_transferred)));
@@ -310,7 +324,16 @@ void AsyncWorker<StreamT>::readEnd(const asio::error_code& error,
 
     read_condition_.notify_all();
   } else {
-    RCLCPP_ERROR(logger_, "U-Blox ASIO transferred zero bytes");
+    ++consecutive_read_errors_;
+    RCLCPP_ERROR(logger_, "U-Blox ASIO transferred zero bytes (error %zu/%zu)",
+                 consecutive_read_errors_,
+                 kMaxConsecutiveReadErrors);
+    if (consecutive_read_errors_ >= kMaxConsecutiveReadErrors) {
+      RCLCPP_FATAL(logger_, "Too many consecutive read errors (%zu), serial communication appears broken. Terminating.",
+                   consecutive_read_errors_);
+      rclcpp::shutdown();
+      std::exit(1);
+    }
   }
 
   if (!stopping_) {
