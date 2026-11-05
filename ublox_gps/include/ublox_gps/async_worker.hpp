@@ -31,7 +31,6 @@
 
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -50,6 +49,9 @@
 #include "worker.hpp"
 
 namespace ublox_gps {
+
+//! The reason AsyncWorker gives rclcpp::shutdown() when a read fails, so main can exit non-zero
+constexpr char kReadErrorShutdownReason[] = "U-Blox input read error";
 
 /**
  * @brief Handles Asynchronous I/O reading and writing.
@@ -147,9 +149,6 @@ class AsyncWorker final : public Worker {
   int debug_; //!< Used to determine which debug messages to display
 
   rclcpp::Logger logger_;
-
-  std::size_t consecutive_read_errors_{0}; //!< Counter for consecutive read errors
-  static constexpr std::size_t kMaxConsecutiveReadErrors{10}; //!< Max errors before terminating
 };
 
 template <typename StreamT>
@@ -284,20 +283,17 @@ void AsyncWorker<StreamT>::readEnd(const asio::error_code& error,
                                    std::size_t bytes_transferred) {
   std::lock_guard<std::mutex> lock(read_mutex_);
   if (error) {
-    ++consecutive_read_errors_;
-    RCLCPP_ERROR(logger_, "U-Blox ASIO input buffer read error: %s, %li (error %zu/%zu)",
-                 error.message().c_str(),
-                 bytes_transferred,
-                 consecutive_read_errors_,
-                 kMaxConsecutiveReadErrors);
-    if (consecutive_read_errors_ >= kMaxConsecutiveReadErrors) {
-      RCLCPP_FATAL(logger_, "Too many consecutive read errors (%zu), serial communication appears broken. Terminating.",
-                   consecutive_read_errors_);
-      rclcpp::shutdown();
-      std::exit(1);
+    // A read that fails does not recover: after the device drops off, every read fails at once,
+    // forever. So stop reading and shut down, for the process to be restarted on the device.
+    // While stopping, the error is just the pending read being cancelled.
+    if (!stopping_) {
+      RCLCPP_FATAL(logger_, "U-Blox ASIO input buffer read error: %s, %li. Shutting down.",
+                   error.message().c_str(),
+                   bytes_transferred);
+      rclcpp::shutdown(nullptr, kReadErrorShutdownReason);
     }
+    return;
   } else if (bytes_transferred > 0) {
-    consecutive_read_errors_ = 0;  // Reset error counter on successful read
     in_buffer_size_ += bytes_transferred;
 
     unsigned char *pRawDataStart = &(*(in_.begin() + (in_buffer_size_ - bytes_transferred)));
@@ -324,16 +320,7 @@ void AsyncWorker<StreamT>::readEnd(const asio::error_code& error,
 
     read_condition_.notify_all();
   } else {
-    ++consecutive_read_errors_;
-    RCLCPP_ERROR(logger_, "U-Blox ASIO transferred zero bytes (error %zu/%zu)",
-                 consecutive_read_errors_,
-                 kMaxConsecutiveReadErrors);
-    if (consecutive_read_errors_ >= kMaxConsecutiveReadErrors) {
-      RCLCPP_FATAL(logger_, "Too many consecutive read errors (%zu), serial communication appears broken. Terminating.",
-                   consecutive_read_errors_);
-      rclcpp::shutdown();
-      std::exit(1);
-    }
+    RCLCPP_ERROR(logger_, "U-Blox ASIO transferred zero bytes");
   }
 
   if (!stopping_) {
